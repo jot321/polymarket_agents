@@ -357,6 +357,184 @@ class Polymarket:
         ).call()
         return float(balance_res / 10e5)
 
+    # ==================== Account Discovery Methods ====================
+
+    def get_market_trades(
+        self, market_condition_id: str = None, limit: int = 100
+    ) -> list:
+        """
+        Fetch recent trades for a market to discover active accounts.
+        If no market_condition_id is provided, fetches trades across all markets.
+        """
+        endpoint = f"{self.clob_url}/trades"
+        params = {"limit": limit}
+        if market_condition_id:
+            params["market"] = market_condition_id
+
+        try:
+            res = httpx.get(endpoint, params=params)
+            if res.status_code == 200:
+                return res.json()
+            return []
+        except Exception as e:
+            print(f"Error fetching trades: {e}")
+            return []
+
+    def get_market_trade_events(
+        self, condition_id: str, limit: int = 100
+    ) -> list:
+        """Fetch trade events for a specific market condition."""
+        try:
+            return self.client.get_market_trades_events(condition_id)
+        except Exception as e:
+            print(f"Error fetching trade events: {e}")
+            return []
+
+    def extract_addresses_from_trades(self, trades: list) -> set:
+        """Extract unique trader addresses from a list of trades."""
+        addresses = set()
+        for trade in trades:
+            if isinstance(trade, dict):
+                if "maker_address" in trade and trade["maker_address"]:
+                    addresses.add(trade["maker_address"].lower())
+                if "owner" in trade and trade["owner"]:
+                    addresses.add(trade["owner"].lower())
+                if "taker" in trade and trade["taker"]:
+                    addresses.add(trade["taker"].lower())
+        return addresses
+
+    def scan_active_accounts(
+        self, market_ids: list = None, limit_per_market: int = 100
+    ) -> set:
+        """
+        Scan for active accounts across specified markets.
+        If no market_ids provided, scans sampling markets.
+        Returns a set of unique addresses.
+        """
+        all_addresses = set()
+
+        if not market_ids:
+            # Get active markets to scan
+            try:
+                sampling_markets = self.client.get_sampling_simplified_markets()
+                market_ids = [
+                    m["condition_id"] for m in sampling_markets.get("data", [])
+                ]
+            except Exception as e:
+                print(f"Error getting sampling markets: {e}")
+                market_ids = []
+
+        for market_id in market_ids:
+            trades = self.get_market_trades(market_id, limit=limit_per_market)
+            addresses = self.extract_addresses_from_trades(trades)
+            all_addresses.update(addresses)
+            print(f"Found {len(addresses)} addresses in market {market_id[:16]}...")
+
+        return all_addresses
+
+    def discover_new_accounts(
+        self, known_addresses: set = None, market_ids: list = None
+    ) -> dict:
+        """
+        Discover new accounts by comparing against known addresses.
+        Returns dict with 'new' and 'all' address sets.
+        """
+        if known_addresses is None:
+            known_addresses = set()
+
+        current_addresses = self.scan_active_accounts(market_ids)
+        new_addresses = current_addresses - known_addresses
+
+        return {
+            "new": new_addresses,
+            "all": current_addresses,
+            "new_count": len(new_addresses),
+            "total_count": len(current_addresses),
+        }
+
+    def get_account_activity(self, address: str) -> dict:
+        """
+        Get trading activity for a specific account address.
+        Returns trade history and summary stats.
+        """
+        endpoint = f"{self.clob_url}/trades"
+        params = {"maker_address": address, "limit": 100}
+
+        try:
+            res = httpx.get(endpoint, params=params)
+            if res.status_code == 200:
+                trades = res.json()
+                return {
+                    "address": address,
+                    "trade_count": len(trades),
+                    "trades": trades,
+                    "markets_traded": list(
+                        set(t.get("market", "") for t in trades if t.get("market"))
+                    ),
+                }
+            return {"address": address, "trade_count": 0, "trades": [], "markets_traded": []}
+        except Exception as e:
+            print(f"Error fetching account activity: {e}")
+            return {"address": address, "error": str(e)}
+
+    def continuous_account_scanner(
+        self,
+        known_addresses_file: str = None,
+        scan_interval_seconds: int = 60,
+        callback=None,
+    ):
+        """
+        Continuously scan for new accounts at specified intervals.
+        Optionally save/load known addresses from file.
+        Call callback function when new accounts are found.
+        """
+        import json
+
+        known_addresses = set()
+
+        # Load existing known addresses
+        if known_addresses_file:
+            try:
+                with open(known_addresses_file, "r") as f:
+                    known_addresses = set(json.load(f))
+                print(f"Loaded {len(known_addresses)} known addresses")
+            except FileNotFoundError:
+                print("No existing addresses file, starting fresh")
+
+        print(f"Starting continuous account scanner (interval: {scan_interval_seconds}s)")
+
+        while True:
+            try:
+                result = self.discover_new_accounts(known_addresses)
+
+                if result["new"]:
+                    print(f"\n🆕 Found {result['new_count']} new accounts!")
+                    for addr in result["new"]:
+                        print(f"  - {addr}")
+
+                    # Update known addresses
+                    known_addresses.update(result["new"])
+
+                    # Save to file
+                    if known_addresses_file:
+                        with open(known_addresses_file, "w") as f:
+                            json.dump(list(known_addresses), f)
+
+                    # Call callback if provided
+                    if callback:
+                        callback(result["new"])
+                else:
+                    print(f"No new accounts found. Total tracked: {len(known_addresses)}")
+
+                time.sleep(scan_interval_seconds)
+
+            except KeyboardInterrupt:
+                print("\nScanner stopped by user")
+                break
+            except Exception as e:
+                print(f"Scanner error: {e}")
+                time.sleep(scan_interval_seconds)
+
 
 def test():
     host = "https://clob.polymarket.com"
@@ -383,6 +561,43 @@ def test():
     print(client.get_market("condition_id"))
 
     print("Done!")
+
+
+def demo_account_scanner():
+    """Demo the account scanning functionality."""
+    print("=" * 60)
+    print("Polymarket Account Scanner Demo")
+    print("=" * 60)
+
+    p = Polymarket()
+
+    # One-time scan for active accounts
+    print("\n1. Scanning for active accounts across markets...")
+    addresses = p.scan_active_accounts()
+    print(f"\nFound {len(addresses)} unique active addresses:")
+    for i, addr in enumerate(list(addresses)[:10]):
+        print(f"  {i+1}. {addr}")
+    if len(addresses) > 10:
+        print(f"  ... and {len(addresses) - 10} more")
+
+    # Get activity for a specific account
+    if addresses:
+        sample_addr = list(addresses)[0]
+        print(f"\n2. Getting activity for account: {sample_addr[:16]}...")
+        activity = p.get_account_activity(sample_addr)
+        print(f"   Trade count: {activity.get('trade_count', 0)}")
+        print(f"   Markets traded: {len(activity.get('markets_traded', []))}")
+
+    # Discover new accounts (comparing against empty set)
+    print("\n3. Discovering new accounts...")
+    result = p.discover_new_accounts(known_addresses=set())
+    print(f"   New accounts found: {result['new_count']}")
+    print(f"   Total accounts: {result['total_count']}")
+
+    print("\n" + "=" * 60)
+    print("To run continuous scanning, use:")
+    print("  p.continuous_account_scanner('known_addresses.json', 60)")
+    print("=" * 60)
 
 
 def gamma():
@@ -432,6 +647,21 @@ def main():
 
 if __name__ == "__main__":
     load_dotenv()
+    import sys
+
+    # Check for command line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "scan":
+            # Run account scanner demo
+            demo_account_scanner()
+            sys.exit(0)
+        elif sys.argv[1] == "scan-continuous":
+            # Run continuous scanner
+            p = Polymarket()
+            output_file = sys.argv[2] if len(sys.argv) > 2 else "known_addresses.json"
+            interval = int(sys.argv[3]) if len(sys.argv) > 3 else 60
+            p.continuous_account_scanner(output_file, interval)
+            sys.exit(0)
 
     p = Polymarket()
 
