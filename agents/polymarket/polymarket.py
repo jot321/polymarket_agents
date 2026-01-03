@@ -11,7 +11,12 @@ from dotenv import load_dotenv
 
 from web3 import Web3
 from web3.constants import MAX_INT
-from web3.middleware import geth_poa_middleware
+
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    # web3 v7+ moved this to a different location
+    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
 
 import httpx
 from py_clob_client.client import ClobClient
@@ -563,40 +568,316 @@ def test():
     print("Done!")
 
 
+class PolymarketAccountScanner:
+    """
+    Account scanner that tracks Polymarket users via Blockscout API.
+    No API key required - uses free Polygon Blockscout explorer.
+    """
+
+    def __init__(self):
+        self.gamma_url = "https://gamma-api.polymarket.com"
+        self.blockscout_api = "https://polygon.blockscout.com/api/v2"
+
+        # Polymarket contract addresses on Polygon
+        self.ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # CTF token
+        self.exchange_address = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+        self.neg_risk_exchange = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+        self.neg_risk_adapter = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+
+        self.contract_addresses = {
+            self.ctf_address.lower(),
+            self.exchange_address.lower(),
+            self.neg_risk_exchange.lower(),
+            self.neg_risk_adapter.lower(),
+        }
+
+    def get_contract_transactions(self, contract_address: str, next_page_params: dict = None) -> dict:
+        """Get recent transactions to a contract via Blockscout API."""
+        url = f"{self.blockscout_api}/addresses/{contract_address}/transactions"
+        params = {"filter": "to"}
+
+        # Add pagination params if provided
+        if next_page_params:
+            for key, value in next_page_params.items():
+                params[key] = value
+
+        try:
+            res = httpx.get(url, params=params, timeout=30)
+            if res.status_code == 200:
+                return res.json()
+            return {"items": []}
+        except Exception as e:
+            print(f"Blockscout API error: {e}")
+            return {"items": []}
+
+    def get_token_transfers(self, contract_address: str, next_page_params: dict = None) -> dict:
+        """Get token transfers via Blockscout API."""
+        url = f"{self.blockscout_api}/addresses/{contract_address}/token-transfers"
+        params = {}
+
+        if next_page_params:
+            for key, value in next_page_params.items():
+                params[key] = value
+
+        try:
+            res = httpx.get(url, params=params, timeout=30)
+            if res.status_code == 200:
+                return res.json()
+            return {"items": []}
+        except Exception as e:
+            print(f"Blockscout API error: {e}")
+            return {"items": []}
+
+    def extract_addresses_from_transactions(self, transactions: list) -> set:
+        """Extract unique user addresses from transaction list."""
+        addresses = set()
+        zero_addr = "0x" + "0" * 40
+
+        for tx in transactions:
+            # Get 'from' address (the sender/user)
+            from_data = tx.get("from", {})
+            if isinstance(from_data, dict):
+                from_addr = from_data.get("hash", "").lower()
+            else:
+                from_addr = str(from_data).lower()
+
+            # Skip zero address and contracts
+            if from_addr and from_addr != zero_addr:
+                if from_addr not in self.contract_addresses:
+                    addresses.add(from_addr)
+
+        return addresses
+
+    def extract_addresses_from_transfers(self, transfers: list) -> set:
+        """Extract unique addresses from token transfer list."""
+        addresses = set()
+        zero_addr = "0x" + "0" * 40
+
+        for transfer in transfers:
+            for field in ["from", "to"]:
+                addr_data = transfer.get(field, {})
+                if isinstance(addr_data, dict):
+                    addr = addr_data.get("hash", "").lower()
+                else:
+                    addr = str(addr_data).lower()
+
+                if addr and addr != zero_addr and addr not in self.contract_addresses:
+                    addresses.add(addr)
+
+        return addresses
+
+    def scan_exchange_users(self, num_pages: int = 5) -> set:
+        """Scan users who have interacted with Polymarket exchange contracts."""
+        all_addresses = set()
+
+        contracts = [
+            ("CTF Exchange", self.exchange_address),
+            ("NegRisk Exchange", self.neg_risk_exchange),
+        ]
+
+        for name, contract in contracts:
+            print(f"  Scanning {name}...")
+            next_page_params = None
+
+            for page in range(num_pages):
+                data = self.get_contract_transactions(contract, next_page_params)
+                items = data.get("items", [])
+
+                if not items:
+                    break
+
+                addresses = self.extract_addresses_from_transactions(items)
+                prev_count = len(all_addresses)
+                all_addresses.update(addresses)
+                new_in_page = len(all_addresses) - prev_count
+
+                print(f"    Page {page + 1}: {len(items)} txs, +{new_in_page} new addresses (total: {len(all_addresses)})")
+
+                # Get next page params
+                next_page_params = data.get("next_page_params")
+                if not next_page_params:
+                    break
+
+        return all_addresses
+
+    def scan_ctf_transfers(self, num_pages: int = 5) -> set:
+        """Scan addresses involved in CTF token transfers."""
+        all_addresses = set()
+        next_page_params = None
+
+        print("  Scanning CTF token transfers...")
+        for page in range(num_pages):
+            data = self.get_token_transfers(self.ctf_address, next_page_params)
+            items = data.get("items", [])
+
+            if not items:
+                break
+
+            addresses = self.extract_addresses_from_transfers(items)
+            prev_count = len(all_addresses)
+            all_addresses.update(addresses)
+            new_in_page = len(all_addresses) - prev_count
+
+            print(f"    Page {page + 1}: {len(items)} transfers, +{new_in_page} new addresses (total: {len(all_addresses)})")
+
+            next_page_params = data.get("next_page_params")
+            if not next_page_params:
+                break
+
+        return all_addresses
+
+    def scan_active_accounts(self, method: str = "exchange", num_pages: int = 3) -> set:
+        """
+        Scan for active Polymarket accounts.
+
+        Methods:
+        - 'exchange': Scan exchange contract interactions (faster, most active traders)
+        - 'ctf': Scan CTF token transfers (position holders)
+        - 'all': Both methods combined
+        """
+        all_addresses = set()
+
+        if method in ("exchange", "all"):
+            print("\n📊 Scanning exchange contracts...")
+            exchange_users = self.scan_exchange_users(num_pages=num_pages)
+            all_addresses.update(exchange_users)
+            print(f"  Total from exchanges: {len(exchange_users)}")
+
+        if method in ("ctf", "all"):
+            print("\n🎫 Scanning CTF token transfers...")
+            ctf_holders = self.scan_ctf_transfers(num_pages=num_pages)
+            all_addresses.update(ctf_holders)
+            print(f"  Total from CTF transfers: {len(ctf_holders)}")
+
+        return all_addresses
+
+    def get_account_info(self, address: str) -> dict:
+        """Get info about an account from Blockscout."""
+        url = f"{self.blockscout_api}/addresses/{address}"
+        try:
+            res = httpx.get(url, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                return {
+                    "address": address,
+                    "tx_count": data.get("transactions_count", 0),
+                    "token_transfers": data.get("token_transfers_count", 0),
+                    "is_contract": data.get("is_contract", False),
+                    "blockscout_url": f"https://polygon.blockscout.com/address/{address}"
+                }
+        except Exception as e:
+            print(f"Error: {e}")
+
+        return {"address": address, "error": "Could not fetch info"}
+
+    def discover_new_accounts(self, known_addresses: set = None, method: str = "exchange") -> dict:
+        """Discover new accounts by comparing against known addresses."""
+        if known_addresses is None:
+            known_addresses = set()
+
+        current_addresses = self.scan_active_accounts(method=method)
+        new_addresses = current_addresses - known_addresses
+
+        return {
+            "new": new_addresses,
+            "all": current_addresses,
+            "new_count": len(new_addresses),
+            "total_count": len(current_addresses),
+        }
+
+    def continuous_scan(
+        self,
+        known_addresses_file: str = "known_addresses.json",
+        scan_interval_seconds: int = 60,
+        callback=None,
+    ):
+        """Continuously scan for new accounts."""
+        import json
+
+        known_addresses = set()
+
+        # Load existing
+        try:
+            with open(known_addresses_file, "r") as f:
+                known_addresses = set(json.load(f))
+            print(f"Loaded {len(known_addresses)} known addresses")
+        except FileNotFoundError:
+            print("Starting with empty address list")
+
+        print(f"Starting continuous scanner (interval: {scan_interval_seconds}s)")
+        print("Press Ctrl+C to stop\n")
+
+        while True:
+            try:
+                result = self.discover_new_accounts(known_addresses, method="exchange")
+
+                if result["new"]:
+                    print(f"\n🆕 Found {result['new_count']} new accounts!")
+                    for addr in list(result["new"])[:10]:
+                        print(f"  - {addr}")
+                    if result["new_count"] > 10:
+                        print(f"  ... and {result['new_count'] - 10} more")
+
+                    known_addresses.update(result["new"])
+
+                    with open(known_addresses_file, "w") as f:
+                        json.dump(list(known_addresses), f)
+
+                    if callback:
+                        callback(result["new"])
+                else:
+                    print(f"No new accounts. Total tracked: {len(known_addresses)}")
+
+                time.sleep(scan_interval_seconds)
+
+            except KeyboardInterrupt:
+                print("\nScanner stopped")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+                time.sleep(scan_interval_seconds)
+
+
 def demo_account_scanner():
     """Demo the account scanning functionality."""
     print("=" * 60)
     print("Polymarket Account Scanner Demo")
     print("=" * 60)
+    print("Scanning Polymarket activity via Blockscout API...")
+    print("(Free, no API key required)\n")
 
-    p = Polymarket()
+    scanner = PolymarketAccountScanner()
 
-    # One-time scan for active accounts
-    print("\n1. Scanning for active accounts across markets...")
-    addresses = p.scan_active_accounts()
-    print(f"\nFound {len(addresses)} unique active addresses:")
-    for i, addr in enumerate(list(addresses)[:10]):
-        print(f"  {i+1}. {addr}")
-    if len(addresses) > 10:
-        print(f"  ... and {len(addresses) - 10} more")
+    # Scan for active accounts using CTF transfers (most diverse results)
+    print("Scanning for active Polymarket accounts...")
+    addresses = scanner.scan_active_accounts(method="ctf", num_pages=5)
 
-    # Get activity for a specific account
+    print(f"\n✅ Found {len(addresses)} unique trader addresses:")
+    print("-" * 50)
+    for i, addr in enumerate(sorted(list(addresses))[:25]):
+        print(f"  {i+1:2}. {addr}")
+    if len(addresses) > 25:
+        print(f"  ... and {len(addresses) - 25} more")
+
+    # Get info on sample account
     if addresses:
-        sample_addr = list(addresses)[0]
-        print(f"\n2. Getting activity for account: {sample_addr[:16]}...")
-        activity = p.get_account_activity(sample_addr)
-        print(f"   Trade count: {activity.get('trade_count', 0)}")
-        print(f"   Markets traded: {len(activity.get('markets_traded', []))}")
-
-    # Discover new accounts (comparing against empty set)
-    print("\n3. Discovering new accounts...")
-    result = p.discover_new_accounts(known_addresses=set())
-    print(f"   New accounts found: {result['new_count']}")
-    print(f"   Total accounts: {result['total_count']}")
+        sample = sorted(list(addresses))[0]
+        print(f"\n📋 Sample account info:")
+        info = scanner.get_account_info(sample)
+        print(f"   Address: {sample}")
+        print(f"   Total transactions: {info.get('tx_count', 'N/A')}")
+        print(f"   Token transfers: {info.get('token_transfers', 'N/A')}")
+        print(f"   View: {info.get('blockscout_url', 'N/A')}")
 
     print("\n" + "=" * 60)
-    print("To run continuous scanning, use:")
-    print("  p.continuous_account_scanner('known_addresses.json', 60)")
+    print("Summary:")
+    print(f"  Total unique accounts: {len(addresses)}")
+    print(f"  Data source: Blockscout API (Polygon CTF token transfers)")
+    print("=" * 60)
+    print("\nUsage:")
+    print("  scanner = PolymarketAccountScanner()")
+    print("  addresses = scanner.scan_active_accounts(method='ctf', num_pages=10)")
+    print("  scanner.continuous_scan('known_addresses.json', 60)")
     print("=" * 60)
 
 
@@ -656,11 +937,11 @@ if __name__ == "__main__":
             demo_account_scanner()
             sys.exit(0)
         elif sys.argv[1] == "scan-continuous":
-            # Run continuous scanner
-            p = Polymarket()
+            # Run continuous scanner (no auth required)
+            scanner = PolymarketAccountScanner()
             output_file = sys.argv[2] if len(sys.argv) > 2 else "known_addresses.json"
             interval = int(sys.argv[3]) if len(sys.argv) > 3 else 60
-            p.continuous_account_scanner(output_file, interval)
+            scanner.continuous_scan(output_file, interval)
             sys.exit(0)
 
     p = Polymarket()
